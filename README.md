@@ -52,6 +52,7 @@ with:
 - It does not infer the latent row-level allocations.
 - It does not fit the allocation-stage hierarchical mixture model.
 - It does not implement arbitrary-`K` mixtures.
+- It does not own benchmark or simulation code; those now live in `GLAM.jl`.
 - It does not generalize beyond the binary logistic regression used in the original demo.
 
 ## Interplay With `HierarchicalMogSampler.jl`
@@ -88,9 +89,10 @@ Pkg.develop(path="SOMSOS.jl")
 ## Quick Demo
 
 The example below is mirrored in
-[`examples/readme_demo.jl`](examples/readme_demo.jl). It simulates full labeled patient
-matrices plus binary outcomes from the original GLAM-style regime, then fits the extracted
-scalar-on-matrix regression sampler.
+[`examples/readme_demo.jl`](examples/readme_demo.jl). It builds a small labeled toy dataset
+in-place, fits both the cluster-aware regression and the naive non-cluster-aware baseline,
+and compares their posterior inclusion probabilities. For reproducible simulation regimes
+and multi-replicate benchmarks, use `GLAM.jl`.
 
 ```julia
 using Random
@@ -99,27 +101,42 @@ using SOMSOS
 
 rng = MersenneTwister(20260406)
 
-sim = simulate_glam_style_regression_data(
-    rng,
-    SimulationConfig(
-        n_subjects = 48,
-        n_features = 8,
-        min_repeats = 12,
-        max_repeats = 18,
-    );
-    active_indices = [1, 3, 5],
-    active_values = [2.6, -2.2, 1.8],
-    true_t = 0.85,
-    true_intercept = 0.4,
-)
+function make_demo_data(rng; n_patients = 32)
+    patients = LabeledPatientMatrix[]
+    y = Int[]
+    true_beta = [2.1, 0.0, -1.5]
+    true_t = 0.8
+    true_intercept = 0.2
 
-result = sample_regression(rng, sim.data, RegressionConfig(), 200; burnin = 100, thin = 20)
+    for _ in 1:n_patients
+        component1 = hcat(
+            -1.3 .+ 0.25 .* randn(rng, 5),
+            0.15 .* randn(rng, 5),
+            -1.0 .+ 0.25 .* randn(rng, 5),
+        )
+        component2 = hcat(
+            1.3 .+ 0.25 .* randn(rng, 6),
+            0.15 .* randn(rng, 6),
+            1.0 .+ 0.25 .* randn(rng, 6),
+        )
+        patient = LabeledPatientMatrix(vcat(component1, component2), vcat(fill(1, 5), fill(2, 6)))
+        signal = working_design([patient], true_t)[1, :]
+        eta = true_intercept + sum(signal .* true_beta)
+        push!(patients, patient)
+        push!(y, rand(rng) < 1 / (1 + exp(-eta)) ? 1 : 0)
+    end
 
-println("saved draws: ", length(result.samples))
-println("posterior mean t: ", round(result.summary.mean_t; digits = 3))
-println("posterior inclusion probabilities: ", round.(result.summary.pip; digits = 3))
-println("last log posterior: ", round(result.final_sample.logposterior; digits = 2))
-println("true active set: ", findall(==(1), sim.true_gamma))
+    return ScalarOnMatrixData(patients, y)
+end
+
+data = make_demo_data(rng)
+aware = sample_regression(rng, data, RegressionConfig(), 200; burnin = 100, thin = 20)
+naive = sample_naive_regression(rng, data, RegressionConfig(), 200; burnin = 100, thin = 20)
+
+println("cluster-aware mean t: ", round(aware.summary.mean_t; digits = 3))
+println("cluster-aware PIPs: ", round.(aware.summary.pip; digits = 3))
+println("naive PIPs: ", round.(naive.summary.pip; digits = 3))
+println("first five aware probabilities: ", round.(predict_probabilities(aware, data)[1:5]; digits = 3))
 ```
 
 ## Public API
@@ -139,31 +156,34 @@ println("true active set: ", findall(==(1), sim.true_gamma))
   Build the deterministic component-specific patient summary matrices.
 - `working_design(design, t)` or `working_design(data, t)`
   Form the working regression design at a given `t`.
+- `naive_average_matrix(data)` or `naive_average_matrix(x)`
+  Build the non-cluster-aware patient-by-feature matrix used by the baseline comparator.
 
 ### Sampler API
 
 - `sample_regression([rng], data, cfg, n_iters; burnin=0, thin=1)`
-  Run the extracted posterior sampler.
+  Run the cluster-aware posterior sampler.
+- `sample_naive_regression([rng], data_or_x, cfg, n_iters; burnin=0, thin=1)`
+  Run the naive non-cluster-aware baseline on patient averages.
 - `logposterior(data, sample, cfg)`
   Recompute the log posterior for a saved draw.
+- `predict_probabilities(result_or_summary_or_sample, data_or_design)`
+  Compute fitted response probabilities for either the cluster-aware or naive model.
 
 ### Result Types
 
 - `RegressionSample`
   One saved posterior draw.
 - `RegressionSummary`
-  Mean coefficients, posterior inclusion probabilities, mean `t`, mean intercept, and
-  acceptance rates.
+  Mean coefficients, mean active coefficients, posterior inclusion probabilities, mean `t`,
+  mean intercept, and acceptance rates.
 - `RegressionResult`
   Saved draws, summary, traces, and the final state.
-
-### Simulation Helpers
-
-- `SimulationConfig`
-  Controls the built-in GLAM-style simulator.
-- `simulate_glam_style_regression_data(...)`
-  Generate labeled patient matrices plus binary outcomes from the original synthetic
-  regime.
+- `NaiveRegressionSummary`
+  Mean coefficients, mean active coefficients, posterior inclusion probabilities, mean
+  intercept, and acceptance rates for the naive baseline.
+- `NaiveRegressionResult`
+  Saved draws, summary, traces, and the final state for the naive baseline.
 
 ## Notes On Input Labels
 
@@ -178,4 +198,6 @@ Internally, SOMSOS always uses `1/2`.
 
 This repository is intentionally narrow. It exists to provide a clean, documented package
 for the scalar-on-matrix regression stage only, with an input boundary that makes it easy
-to pair with a separate allocation sampler.
+to pair with a separate allocation sampler. `GLAM.jl` is the package that owns
+reproducible simulation regimes and benchmark orchestration across `HierarchicalMogSampler`
+and `SOMSOS`.

@@ -12,16 +12,19 @@ export LabeledPatientMatrix,
        RegressionSample,
        RegressionSummary,
        RegressionResult,
-       SimulationConfig,
-       SimulationResult,
+       NaiveRegressionSample,
+       NaiveRegressionSummary,
+       NaiveRegressionResult,
        labeled_patients,
        n_subjects,
        n_features,
        build_component_design,
        working_design,
+       naive_average_matrix,
        sample_regression,
-       logposterior,
-       simulate_glam_style_regression_data
+       sample_naive_regression,
+       predict_probabilities,
+       logposterior
 
 """
     LabeledPatientMatrix(x, z)
@@ -29,8 +32,8 @@ export LabeledPatientMatrix,
 One patient's repeated measurements together with a fixed two-component allocation for
 each row.
 
-`x` must be an `n_i x p` matrix and `z` must have length `n_i`. Labels may be supplied
-either as `0/1` or `1/2`; internally they are stored as `1/2`.
+`x` must be an `n_i x p` matrix and `z` must have length `n_i`. Labels may be supplied as
+`0/1` or `1/2`; internally they are stored as `1/2`.
 """
 struct LabeledPatientMatrix
     x::Matrix{Float64}
@@ -54,6 +57,12 @@ function _normalize_labels(z::AbstractVector{<:Integer})
     throw(ArgumentError("Allocations must use labels {0,1} or {1,2}."))
 end
 
+function _normalize_binary_vector(y::AbstractVector{<:Integer})
+    values = Int.(collect(y))
+    all(in((0, 1)), values) || throw(ArgumentError("Responses must be binary values in {0,1}."))
+    return values
+end
+
 """
     labeled_patients(x, z)
 
@@ -75,10 +84,10 @@ end
     ScalarOnMatrixData(patients, y)
     ScalarOnMatrixData(x, z, y)
 
-Binary scalar responses together with patient-level labeled matrices for the SOMSOS model.
+Binary scalar responses together with patient-level labeled matrices for the cluster-aware
+SOMSOS model.
 
-All patients must have the same number of features. `y` is validated to contain only `0`
-and `1`.
+All patients must have the same number of features. `y` must contain only `0` and `1`.
 """
 struct ScalarOnMatrixData
     patients::Vector{LabeledPatientMatrix}
@@ -88,9 +97,8 @@ struct ScalarOnMatrixData
         y::AbstractVector{<:Integer},
     )
         isempty(patients) && throw(ArgumentError("ScalarOnMatrixData requires at least one patient."))
-        labels = Int.(collect(y))
+        labels = _normalize_binary_vector(y)
         length(patients) == length(labels) || throw(ArgumentError("The response vector must match the number of patients."))
-        all(in((0, 1)), labels) || throw(ArgumentError("Responses must be binary values in {0,1}."))
         p = size(patients[1].x, 2)
         for (i, patient) in pairs(patients)
             size(patient.x, 2) == p || throw(ArgumentError("Patient $i has a different feature dimension."))
@@ -122,7 +130,7 @@ n_features(data::ScalarOnMatrixData) = size(data.patients[1].x, 2)
 """
     ComponentDesign
 
-Deterministic design matrices derived from the labeled patient matrices.
+Deterministic design matrices derived from labeled patient matrices.
 
 For patient `i`, `component1[i, :]` and `component2[i, :]` are the sums of the rows
 assigned to components 1 and 2 respectively, each divided by the patient's total number of
@@ -135,19 +143,22 @@ struct ComponentDesign
 end
 
 """
+    build_component_design(patients)
     build_component_design(data)
+    build_component_design(x, z)
 
 Convert labeled patient matrices into the component-specific patient summaries used by the
-scalar-on-matrix regression stage.
+cluster-aware scalar-on-matrix regression stage.
 """
-function build_component_design(data::ScalarOnMatrixData)
-    n = n_subjects(data)
-    p = n_features(data)
+function build_component_design(patients::Vector{LabeledPatientMatrix})
+    isempty(patients) && throw(ArgumentError("At least one labeled patient is required."))
+    n = length(patients)
+    p = size(patients[1].x, 2)
     component1 = zeros(n, p)
     component2 = zeros(n, p)
 
     for i in 1:n
-        patient = data.patients[i]
+        patient = patients[i]
         Xi = patient.x
         zi = patient.z
         n_i = size(Xi, 1)
@@ -165,19 +176,55 @@ function build_component_design(data::ScalarOnMatrixData)
     return ComponentDesign(component1, component2)
 end
 
+build_component_design(data::ScalarOnMatrixData) = build_component_design(data.patients)
+build_component_design(
+    x::Vector{<:AbstractMatrix{<:Real}},
+    z::Vector{<:AbstractVector{<:Integer}},
+) = build_component_design(labeled_patients(x, z))
+
+"""
+    working_design(design, t)
+    working_design(data, t)
+    working_design(patients, t)
+
+Compute the patient-by-feature design matrix `t * component1 + (1 - t) * component2`.
+"""
+working_design(design::ComponentDesign, t::Float64) = t .* design.component1 .+ (1 - t) .* design.component2
+working_design(data::ScalarOnMatrixData, t::Float64) = working_design(build_component_design(data), t)
+working_design(patients::Vector{LabeledPatientMatrix}, t::Float64) = working_design(build_component_design(patients), t)
+
+"""
+    naive_average_matrix(x)
+    naive_average_matrix(data)
+    naive_average_matrix(patients)
+
+Compute the patient-by-feature matrix obtained by averaging each patient's repeated
+measurements without using cluster labels. This is the non-cluster-aware comparator used
+in the CLUSSO-style baseline.
+"""
+function naive_average_matrix(x::Vector{<:AbstractMatrix{<:Real}})
+    isempty(x) && throw(ArgumentError("At least one patient matrix is required."))
+    p = size(x[1], 2)
+    Xbar = zeros(length(x), p)
+    for (i, Xi) in pairs(x)
+        size(Xi, 2) == p || throw(ArgumentError("Patient $i has a different feature dimension."))
+        Xbar[i, :] .= vec(mean(Xi, dims = 1))
+    end
+    return Xbar
+end
+
+naive_average_matrix(patients::Vector{LabeledPatientMatrix}) = naive_average_matrix([patient.x for patient in patients])
+naive_average_matrix(data::ScalarOnMatrixData) = naive_average_matrix(data.patients)
+
 """
     RegressionConfig(; kwargs...)
 
-Hyperparameters and proposal scales for the scalar-on-matrix spike-and-slab logistic
-regression model extracted from the original GLAM demo.
+Hyperparameters and proposal scales for the extracted spike-and-slab logistic regression
+sampler.
 
-The model uses:
-- spike-and-slab inclusion indicators `gamma`,
-- Gaussian coefficients `beta`,
-- a Gaussian prior on the intercept,
-- a Beta prior on the mixing weight `t`,
-- a Beta-Bernoulli prior on feature inclusion,
-- an inverse-Gamma prior on the slab variance.
+The same configuration type is used for both the cluster-aware and naive baselines. In the
+naive baseline, the `a_alpha`, `b_alpha`, and `u_step` fields are unused because there is
+no learned mixing weight `t`.
 """
 Base.@kwdef struct RegressionConfig
     a_alpha::Float64 = 2.0
@@ -204,16 +251,7 @@ end
 """
     RegressionSample
 
-One saved posterior draw from the SOMSOS regression sampler.
-
-Fields:
-- `beta`: coefficient vector.
-- `gamma`: spike-and-slab inclusion indicators.
-- `intercept`: logistic intercept.
-- `t`: scalar mixing weight in `[0,1]`.
-- `omega`: marginal feature-inclusion probability.
-- `tau2`: slab variance.
-- `logposterior`: joint log posterior for this draw.
+One saved posterior draw from the cluster-aware SOMSOS regression sampler.
 """
 struct RegressionSample
     beta::Vector{Float64}
@@ -228,10 +266,14 @@ end
 """
     RegressionSummary
 
-Posterior summaries averaged across saved draws.
+Posterior summaries averaged across saved cluster-aware draws.
+
+`mean_active_beta` stores the posterior mean of `beta .* gamma`, which is the quantity used
+for prediction.
 """
 struct RegressionSummary
     mean_beta::Vector{Float64}
+    mean_active_beta::Vector{Float64}
     pip::Vector{Float64}
     mean_t::Float64
     mean_intercept::Float64
@@ -244,14 +286,6 @@ end
     RegressionResult
 
 Output from [`sample_regression`](@ref).
-
-Fields:
-- `samples`: saved posterior draws after burn-in and thinning.
-- `summary`: posterior means and inclusion probabilities.
-- `logposterior_trace`: log posterior at every iteration.
-- `t_trace`: sampled `t` trace at every iteration.
-- `active_trace`: number of active features at every iteration.
-- `final_sample`: final Gibbs/MALA state, whether or not it was saved.
 """
 struct RegressionResult
     samples::Vector{RegressionSample}
@@ -263,40 +297,47 @@ struct RegressionResult
 end
 
 """
-    SimulationConfig(; n_subjects=96, n_features=6, min_repeats=14, max_repeats=22)
+    NaiveRegressionSample
 
-Settings for the built-in simulator that reproduces the full GLAM-style allocation-plus-
-regression data regime.
+One saved posterior draw from the naive non-cluster-aware baseline.
 """
-Base.@kwdef struct SimulationConfig
-    n_subjects::Int = 96
-    n_features::Int = 6
-    min_repeats::Int = 14
-    max_repeats::Int = 22
+struct NaiveRegressionSample
+    beta::Vector{Float64}
+    gamma::Vector{Int}
+    intercept::Float64
+    omega::Float64
+    tau2::Float64
+    logposterior::Float64
 end
 
 """
-    SimulationResult
+    NaiveRegressionSummary
 
-Output from [`simulate_glam_style_regression_data`](@ref).
+Posterior summaries averaged across saved naive baseline draws.
 
-Fields:
-- `data`: labeled patient matrices and binary responses ready for SOMSOS.
-- `true_beta`: true regression coefficients.
-- `true_gamma`: active-feature indicators.
-- `true_t`: true scalar mixing weight.
-- `true_intercept`: true logistic intercept.
-- `true_component2_prob`: patient-specific probability of component 2.
-- `true_global_means`: global component means used to simulate patient-specific means.
+`mean_active_beta` stores the posterior mean of `beta .* gamma`, which is the quantity used
+for prediction.
 """
-struct SimulationResult
-    data::ScalarOnMatrixData
-    true_beta::Vector{Float64}
-    true_gamma::Vector{Int}
-    true_t::Float64
-    true_intercept::Float64
-    true_component2_prob::Vector{Float64}
-    true_global_means::Matrix{Float64}
+struct NaiveRegressionSummary
+    mean_beta::Vector{Float64}
+    mean_active_beta::Vector{Float64}
+    pip::Vector{Float64}
+    mean_intercept::Float64
+    beta_acceptance::Float64
+    intercept_acceptance::Float64
+end
+
+"""
+    NaiveRegressionResult
+
+Output from [`sample_naive_regression`](@ref).
+"""
+struct NaiveRegressionResult
+    samples::Vector{NaiveRegressionSample}
+    summary::NaiveRegressionSummary
+    logposterior_trace::Vector{Float64}
+    active_trace::Vector{Int}
+    final_sample::NaiveRegressionSample
 end
 
 @inline sigmoid(x::Float64) = x >= 0 ? inv(1 + exp(-x)) : exp(x) / (1 + exp(x))
@@ -311,129 +352,52 @@ function logistic_loglik_sum(y::Vector{Int}, eta::Vector{Float64})
     return total
 end
 
-function _make_true_parameters(
-    p::Int;
-    active_indices::Vector{Int},
-    active_values::Vector{Float64},
-)
-    beta = zeros(p)
-    gamma = zeros(Int, p)
-    for (val, idx) in zip(active_values, active_indices)
-        1 <= idx <= p || continue
-        gamma[idx] = 1
-        beta[idx] = val
-    end
-
-    global_means = zeros(2, p)
-    for ell in 1:p
-        if gamma[ell] == 1
-            global_means[1, ell] = -1.5 - 0.15 * ell
-            global_means[2, ell] = 1.5 + 0.15 * ell
-        else
-            global_means[1, ell] = -0.15 * iseven(ell)
-            global_means[2, ell] = 0.15 * iseven(ell)
-        end
-    end
-    return beta, gamma, global_means
+function isotropic_logpdf(x::Vector{Float64}, mean::Vector{Float64}, step::Float64)
+    d = length(x)
+    diff = x .- mean
+    return -0.5 * (d * log(2π * step^2) + dot(diff, diff) / step^2)
 end
 
-"""
-    simulate_glam_style_regression_data([rng], config=SimulationConfig();
-        active_indices=[1], active_values=[2.5], true_t=0.8, true_intercept=1.0)
-
-Simulate the full labeled repeated-measurement plus binary-response regime used by the
-original GLAM demo.
-
-This is primarily intended for testing and README examples. The repeated-measurement
-portion matches the earlier `HierarchicalMogSampler.jl` package in spirit and label
-convention: labels are returned as `1/2`.
-"""
-function simulate_glam_style_regression_data(
+function mala_step_vector!(
     rng::AbstractRNG,
-    config::SimulationConfig = SimulationConfig();
-    active_indices::Vector{Int} = [1],
-    active_values::Vector{Float64} = [2.5],
-    true_t::Float64 = 0.80,
-    true_intercept::Float64 = 1.0,
+    current::Vector{Float64},
+    step::Float64,
+    target_grad::Function,
 )
-    config.n_subjects > 0 || throw(ArgumentError("n_subjects must be positive."))
-    config.n_features > 0 || throw(ArgumentError("n_features must be positive."))
-    config.min_repeats > 0 || throw(ArgumentError("min_repeats must be positive."))
-    config.max_repeats >= config.min_repeats ||
-        throw(ArgumentError("max_repeats must be at least min_repeats."))
-
-    n = config.n_subjects
-    p = config.n_features
-    beta, gamma, global_means = _make_true_parameters(
-        p;
-        active_indices = active_indices,
-        active_values = active_values,
-    )
-
-    Sigma_true = [
-        Matrix(Diagonal(fill(0.45, p))),
-        Matrix(Diagonal(fill(0.60, p))),
-    ]
-
-    patients = Vector{LabeledPatientMatrix}(undef, n)
-    y = Vector{Int}(undef, n)
-    true_component2_prob = Vector{Float64}(undef, n)
-
-    for i in 1:n
-        n_i = rand(rng, config.min_repeats:config.max_repeats)
-        prob2 = rand(rng, Beta(2.4, 2.0))
-        true_component2_prob[i] = prob2
-
-        lambda = [rand(rng, Gamma(5.0, 1 / 5.0)) for _ in 1:2]
-        mu = [
-            rand(rng, MvNormal(global_means[k, :], Symmetric(Sigma_true[k] / (1.5 * lambda[k]))))
-            for k in 1:2
-        ]
-
-        Xi = Matrix{Float64}(undef, n_i, p)
-        zi = Vector{Int}(undef, n_i)
-        sums = zeros(2, p)
-        for j in 1:n_i
-            k = rand(rng) < prob2 ? 2 : 1
-            zi[j] = k
-            xij = rand(rng, MvNormal(mu[k], Symmetric(Sigma_true[k] / lambda[k])))
-            Xi[j, :] = xij
-            sums[k, :] .+= xij
-        end
-
-        s1 = sums[1, :] ./ n_i
-        s2 = sums[2, :] ./ n_i
-        weighted = true_t .* s1 .+ (1 - true_t) .* s2
-        eta = true_intercept + dot(weighted, beta .* gamma)
-        y[i] = rand(rng) < sigmoid(eta) ? 1 : 0
-
-        patients[i] = LabeledPatientMatrix(Xi, zi)
+    lp, grad = target_grad(current)
+    mean_forward = current .+ 0.5 * step^2 .* grad
+    proposal = mean_forward .+ step .* randn(rng, length(current))
+    lp_prop, grad_prop = target_grad(proposal)
+    mean_reverse = proposal .+ 0.5 * step^2 .* grad_prop
+    logq_forward = isotropic_logpdf(proposal, mean_forward, step)
+    logq_reverse = isotropic_logpdf(current, mean_reverse, step)
+    log_accept = lp_prop + logq_reverse - lp - logq_forward
+    if log(rand(rng)) < log_accept
+        current .= proposal
+        return true
     end
-
-    return SimulationResult(
-        ScalarOnMatrixData(patients, y),
-        beta,
-        gamma,
-        true_t,
-        true_intercept,
-        true_component2_prob,
-        global_means,
-    )
+    return false
 end
 
-simulate_glam_style_regression_data(config::SimulationConfig = SimulationConfig(); kwargs...) =
-    simulate_glam_style_regression_data(Random.default_rng(), config; kwargs...)
-
-"""
-    working_design(design, t)
-    working_design(data, t)
-
-Compute the patient-by-feature regression design matrix
-
-`t * component1 + (1 - t) * component2`.
-"""
-working_design(design::ComponentDesign, t::Float64) = t .* design.component1 .+ (1 - t) .* design.component2
-working_design(data::ScalarOnMatrixData, t::Float64) = working_design(build_component_design(data), t)
+function mala_step_scalar(
+    rng::AbstractRNG,
+    current::Float64,
+    step::Float64,
+    target_grad::Function,
+)
+    lp, grad = target_grad(current)
+    mean_forward = current + 0.5 * step^2 * grad
+    proposal = mean_forward + step * randn(rng)
+    lp_prop, grad_prop = target_grad(proposal)
+    mean_reverse = proposal + 0.5 * step^2 * grad_prop
+    logq_forward = logpdf(Normal(mean_forward, step), proposal)
+    logq_reverse = logpdf(Normal(mean_reverse, step), current)
+    log_accept = lp_prop + logq_reverse - lp - logq_forward
+    if log(rand(rng)) < log_accept
+        return proposal, true
+    end
+    return current, false
+end
 
 function _initialize_state(rng::AbstractRNG, design::ComponentDesign, y::Vector{Int})
     p = size(design.component1, 2)
@@ -538,53 +502,6 @@ function _logposterior(
     return lp
 end
 
-function isotropic_logpdf(x::Vector{Float64}, mean::Vector{Float64}, step::Float64)
-    d = length(x)
-    diff = x .- mean
-    return -0.5 * (d * log(2π * step^2) + dot(diff, diff) / step^2)
-end
-
-function mala_step_vector!(
-    rng::AbstractRNG,
-    current::Vector{Float64},
-    step::Float64,
-    target_grad::Function,
-)
-    lp, grad = target_grad(current)
-    mean_forward = current .+ 0.5 * step^2 .* grad
-    proposal = mean_forward .+ step .* randn(rng, length(current))
-    lp_prop, grad_prop = target_grad(proposal)
-    mean_reverse = proposal .+ 0.5 * step^2 .* grad_prop
-    logq_forward = isotropic_logpdf(proposal, mean_forward, step)
-    logq_reverse = isotropic_logpdf(current, mean_reverse, step)
-    log_accept = lp_prop + logq_reverse - lp - logq_forward
-    if log(rand(rng)) < log_accept
-        current .= proposal
-        return true
-    end
-    return false
-end
-
-function mala_step_scalar(
-    rng::AbstractRNG,
-    current::Float64,
-    step::Float64,
-    target_grad::Function,
-)
-    lp, grad = target_grad(current)
-    mean_forward = current + 0.5 * step^2 * grad
-    proposal = mean_forward + step * randn(rng)
-    lp_prop, grad_prop = target_grad(proposal)
-    mean_reverse = proposal + 0.5 * step^2 * grad_prop
-    logq_forward = logpdf(Normal(mean_forward, step), proposal)
-    logq_reverse = logpdf(Normal(mean_reverse, step), current)
-    log_accept = lp_prop + logq_reverse - lp - logq_forward
-    if log(rand(rng)) < log_accept
-        return proposal, true
-    end
-    return current, false
-end
-
 function _update_gamma!(
     rng::AbstractRNG,
     design::ComponentDesign,
@@ -635,33 +552,72 @@ function _summarize_samples(
 )
     isempty(samples) && throw(ArgumentError("At least one saved sample is required to summarize the chain."))
     p = length(samples[1].beta)
-    beta = zeros(p)
+    mean_beta = zeros(p)
+    mean_active_beta = zeros(p)
     pip = zeros(p)
-    t = 0.0
-    intercept = 0.0
+    mean_t = 0.0
+    mean_intercept = 0.0
     for sample in samples
-        beta .+= sample.beta
+        mean_beta .+= sample.beta
+        mean_active_beta .+= sample.beta .* sample.gamma
         pip .+= sample.gamma
-        t += sample.t
-        intercept += sample.intercept
+        mean_t += sample.t
+        mean_intercept += sample.intercept
     end
     m = length(samples)
     return RegressionSummary(
-        beta ./ m,
+        mean_beta ./ m,
+        mean_active_beta ./ m,
         pip ./ m,
-        t / m,
-        intercept / m,
+        mean_t / m,
+        mean_intercept / m,
         beta_accept / n_iters,
         intercept_accept / n_iters,
         t_accept / n_iters,
     )
 end
 
+function _predict_probabilities(design::ComponentDesign, active_beta::Vector{Float64}, intercept::Float64, t::Float64)
+    w = working_design(design, t)
+    return sigmoid.(intercept .+ w * active_beta)
+end
+
+"""
+    predict_probabilities(sample_or_summary_or_result, patients)
+    predict_probabilities(sample_or_summary_or_result, data)
+    predict_probabilities(sample_or_summary_or_result, design)
+    predict_probabilities(sample_or_summary_or_result, x, z)
+
+Predict binary-response probabilities from the cluster-aware SOMSOS model using either a
+single draw, a posterior summary, or a full result object.
+"""
+function predict_probabilities(sample::RegressionSample, design::ComponentDesign)
+    return _predict_probabilities(design, sample.beta .* sample.gamma, sample.intercept, sample.t)
+end
+
+function predict_probabilities(summary::RegressionSummary, design::ComponentDesign)
+    return _predict_probabilities(design, summary.mean_active_beta, summary.mean_intercept, summary.mean_t)
+end
+
+predict_probabilities(result::RegressionResult, design::ComponentDesign) = predict_probabilities(result.summary, design)
+predict_probabilities(sample::RegressionSample, patients::Vector{LabeledPatientMatrix}) = predict_probabilities(sample, build_component_design(patients))
+predict_probabilities(summary::RegressionSummary, patients::Vector{LabeledPatientMatrix}) = predict_probabilities(summary, build_component_design(patients))
+predict_probabilities(result::RegressionResult, patients::Vector{LabeledPatientMatrix}) = predict_probabilities(result.summary, build_component_design(patients))
+predict_probabilities(sample::RegressionSample, data::ScalarOnMatrixData) = predict_probabilities(sample, data.patients)
+predict_probabilities(summary::RegressionSummary, data::ScalarOnMatrixData) = predict_probabilities(summary, data.patients)
+predict_probabilities(result::RegressionResult, data::ScalarOnMatrixData) = predict_probabilities(result.summary, data.patients)
+predict_probabilities(sample::RegressionSample, x::Vector{<:AbstractMatrix{<:Real}}, z::Vector{<:AbstractVector{<:Integer}}) =
+    predict_probabilities(sample, labeled_patients(x, z))
+predict_probabilities(summary::RegressionSummary, x::Vector{<:AbstractMatrix{<:Real}}, z::Vector{<:AbstractVector{<:Integer}}) =
+    predict_probabilities(summary, labeled_patients(x, z))
+predict_probabilities(result::RegressionResult, x::Vector{<:AbstractMatrix{<:Real}}, z::Vector{<:AbstractVector{<:Integer}}) =
+    predict_probabilities(result.summary, labeled_patients(x, z))
+
 """
     logposterior(data, sample, cfg)
     logposterior(design, y, sample, cfg)
 
-Evaluate the joint log posterior for a saved SOMSOS draw.
+Evaluate the joint log posterior for a saved cluster-aware SOMSOS draw.
 """
 function logposterior(
     design::ComponentDesign,
@@ -679,7 +635,7 @@ function logposterior(
         sample.omega,
         sample.tau2,
     )
-    return _logposterior(design, Int.(collect(y)), state, cfg)
+    return _logposterior(design, _normalize_binary_vector(y), state, cfg)
 end
 
 function logposterior(
@@ -690,16 +646,22 @@ function logposterior(
     return logposterior(build_component_design(data), data.y, sample, cfg)
 end
 
+function logposterior(
+    x::Vector{<:AbstractMatrix{<:Real}},
+    z::Vector{<:AbstractVector{<:Integer}},
+    y::AbstractVector{<:Integer},
+    sample::RegressionSample,
+    cfg::RegressionConfig,
+)
+    return logposterior(build_component_design(x, z), y, sample, cfg)
+end
+
 """
     sample_regression([rng], data, cfg, n_iters; burnin=0, thin=1)
+    sample_regression([rng], x, z, y, cfg, n_iters; burnin=0, thin=1)
 
-Run the scalar-on-matrix spike-and-slab logistic regression sampler on patient-level
-labeled matrices.
-
-The input boundary is deliberately simple: every patient contributes a repeated-measurement
-matrix and a fixed two-class allocation vector. The function converts these into the same
-component-specific patient summaries used in the original GLAM regression stage and then
-runs the extracted sampler.
+Run the cluster-aware spike-and-slab logistic regression sampler on patient-level labeled
+matrices.
 """
 function sample_regression(
     rng::AbstractRNG,
@@ -741,9 +703,8 @@ function sample_regression(
         state.u, accepted = mala_step_scalar(rng, state.u, cfg.u_step, u_target)
         t_accept += accepted ? 1 : 0
 
-        current_t = sigmoid(state.u)
         push!(logpost_trace, _logposterior(design, data.y, state, cfg))
-        push!(t_trace, current_t)
+        push!(t_trace, sigmoid(state.u))
         push!(active_trace, sum(state.gamma))
 
         if iter > burnin && ((iter - burnin) % thin == 0)
@@ -760,7 +721,332 @@ function sample_regression(
     return RegressionResult(samples, summary, logpost_trace, t_trace, active_trace, final_sample)
 end
 
+sample_regression(
+    rng::AbstractRNG,
+    x::Vector{<:AbstractMatrix{<:Real}},
+    z::Vector{<:AbstractVector{<:Integer}},
+    y::AbstractVector{<:Integer},
+    cfg::RegressionConfig,
+    n_iters::Integer;
+    kwargs...,
+) = sample_regression(rng, ScalarOnMatrixData(x, z, y), cfg, n_iters; kwargs...)
+
 sample_regression(data::ScalarOnMatrixData, cfg::RegressionConfig, n_iters::Integer; kwargs...) =
     sample_regression(Random.default_rng(), data, cfg, n_iters; kwargs...)
+
+sample_regression(
+    x::Vector{<:AbstractMatrix{<:Real}},
+    z::Vector{<:AbstractVector{<:Integer}},
+    y::AbstractVector{<:Integer},
+    cfg::RegressionConfig,
+    n_iters::Integer;
+    kwargs...,
+) = sample_regression(Random.default_rng(), x, z, y, cfg, n_iters; kwargs...)
+
+function _initialize_naive_state(rng::AbstractRNG, X::Matrix{Float64}, y::Vector{Int})
+    p = size(X, 2)
+    yc = Float64.(y) .- mean(y)
+    scores = zeros(p)
+    beta = zeros(p)
+    for ell in 1:p
+        x = X[:, ell]
+        xc = x .- mean(x)
+        scores[ell] = abs(dot(xc, yc)) / max(norm(xc) * norm(yc), eps())
+        beta[ell] = 0.8 * sign(dot(xc, yc) + 1e-6)
+    end
+    order = sortperm(scores, rev = true)
+    n_active = min(2, p)
+    gamma = zeros(Int, p)
+    gamma[order[1:n_active]] .= 1
+    beta .+= 0.05 .* randn(rng, p)
+    mean_y = clamp(mean(y), 1e-3, 1 - 1e-3)
+    intercept = log(mean_y / (1 - mean_y))
+    omega = n_active / p
+    return RegressionState(beta, gamma, intercept, 0.0, omega, 1.0)
+end
+
+function _naive_eta(X::Matrix{Float64}, state::RegressionState)
+    return state.intercept .+ X * (state.beta .* state.gamma)
+end
+
+function _logposterior_beta_naive(
+    X::Matrix{Float64},
+    y::Vector{Int},
+    state::RegressionState,
+    beta::Vector{Float64},
+)
+    eta = state.intercept .+ X * (beta .* state.gamma)
+    ll = logistic_loglik_sum(y, eta)
+    grad = transpose(X .* reshape(Float64.(state.gamma), 1, :)) * (Float64.(y) .- sigmoid.(eta))
+    grad = vec(grad) .- beta ./ state.tau2
+    lp = ll - 0.5 * dot(beta, beta) / state.tau2
+    return lp, grad
+end
+
+function _logposterior_intercept_naive(
+    X::Matrix{Float64},
+    y::Vector{Int},
+    state::RegressionState,
+    cfg::RegressionConfig,
+    intercept::Float64,
+)
+    eta = intercept .+ X * (state.beta .* state.gamma)
+    ll = logistic_loglik_sum(y, eta)
+    grad = sum(Float64.(y) .- sigmoid.(eta)) - intercept / (cfg.sigma0^2)
+    lp = ll - 0.5 * intercept^2 / (cfg.sigma0^2)
+    return lp, grad
+end
+
+function _logposterior_naive(
+    X::Matrix{Float64},
+    y::Vector{Int},
+    state::RegressionState,
+    cfg::RegressionConfig,
+)
+    eta = _naive_eta(X, state)
+    lp = logistic_loglik_sum(y, eta)
+    lp += -0.5 * state.intercept^2 / (cfg.sigma0^2)
+    lp += sum(logpdf.(Normal(0.0, sqrt(state.tau2)), state.beta))
+    lp += logpdf(Beta(cfg.a_omega, cfg.b_omega), state.omega)
+    for g in state.gamma
+        prob = g == 1 ? state.omega : 1 - state.omega
+        lp += log(max(prob, eps()))
+    end
+    lp += logpdf(InverseGamma(cfg.a_tau, cfg.b_tau), state.tau2)
+    return lp
+end
+
+function _update_gamma_naive!(
+    rng::AbstractRNG,
+    X::Matrix{Float64},
+    y::Vector{Int},
+    state::RegressionState,
+)
+    eta = _naive_eta(X, state)
+    for ell in eachindex(state.gamma)
+        contrib = X[:, ell] .* state.beta[ell]
+        eta_zero = eta .- state.gamma[ell] .* contrib
+        ll_zero = logistic_loglik_sum(y, eta_zero)
+        eta_one = eta_zero .+ contrib
+        ll_one = logistic_loglik_sum(y, eta_one)
+        logodds = log(max(state.omega, eps())) - log(max(1 - state.omega, eps())) + (ll_one - ll_zero)
+        newgamma = rand(rng) < sigmoid(logodds) ? 1 : 0
+        eta .= eta_zero .+ newgamma .* contrib
+        state.gamma[ell] = newgamma
+    end
+    return nothing
+end
+
+function _naive_sample_from_state(
+    X::Matrix{Float64},
+    y::Vector{Int},
+    state::RegressionState,
+    cfg::RegressionConfig,
+)
+    lp = _logposterior_naive(X, y, state, cfg)
+    return NaiveRegressionSample(
+        copy(state.beta),
+        copy(state.gamma),
+        state.intercept,
+        state.omega,
+        state.tau2,
+        lp,
+    )
+end
+
+function _summarize_naive_samples(
+    samples::Vector{NaiveRegressionSample},
+    beta_accept::Int,
+    intercept_accept::Int,
+    n_iters::Int,
+)
+    isempty(samples) && throw(ArgumentError("At least one saved sample is required to summarize the chain."))
+    p = length(samples[1].beta)
+    mean_beta = zeros(p)
+    mean_active_beta = zeros(p)
+    pip = zeros(p)
+    mean_intercept = 0.0
+    for sample in samples
+        mean_beta .+= sample.beta
+        mean_active_beta .+= sample.beta .* sample.gamma
+        pip .+= sample.gamma
+        mean_intercept += sample.intercept
+    end
+    m = length(samples)
+    return NaiveRegressionSummary(
+        mean_beta ./ m,
+        mean_active_beta ./ m,
+        pip ./ m,
+        mean_intercept / m,
+        beta_accept / n_iters,
+        intercept_accept / n_iters,
+    )
+end
+
+function _predict_probabilities_naive(X::Matrix{Float64}, active_beta::Vector{Float64}, intercept::Float64)
+    return sigmoid.(intercept .+ X * active_beta)
+end
+
+"""
+    predict_probabilities(sample_or_summary_or_result, x)
+    predict_probabilities(sample_or_summary_or_result, data)
+
+Predict binary-response probabilities from the naive non-cluster-aware baseline using a
+single draw, a posterior summary, or a full result object.
+"""
+function predict_probabilities(sample::NaiveRegressionSample, X::Matrix{Float64})
+    return _predict_probabilities_naive(X, sample.beta .* sample.gamma, sample.intercept)
+end
+
+function predict_probabilities(summary::NaiveRegressionSummary, X::Matrix{Float64})
+    return _predict_probabilities_naive(X, summary.mean_active_beta, summary.mean_intercept)
+end
+
+predict_probabilities(result::NaiveRegressionResult, X::Matrix{Float64}) = predict_probabilities(result.summary, X)
+predict_probabilities(sample::NaiveRegressionSample, x::Vector{<:AbstractMatrix{<:Real}}) = predict_probabilities(sample, naive_average_matrix(x))
+predict_probabilities(summary::NaiveRegressionSummary, x::Vector{<:AbstractMatrix{<:Real}}) = predict_probabilities(summary, naive_average_matrix(x))
+predict_probabilities(result::NaiveRegressionResult, x::Vector{<:AbstractMatrix{<:Real}}) = predict_probabilities(result.summary, naive_average_matrix(x))
+predict_probabilities(sample::NaiveRegressionSample, data::ScalarOnMatrixData) = predict_probabilities(sample, naive_average_matrix(data))
+predict_probabilities(summary::NaiveRegressionSummary, data::ScalarOnMatrixData) = predict_probabilities(summary, naive_average_matrix(data))
+predict_probabilities(result::NaiveRegressionResult, data::ScalarOnMatrixData) = predict_probabilities(result.summary, naive_average_matrix(data))
+
+"""
+    logposterior(x, y, sample, cfg)
+    logposterior(data, sample, cfg)
+
+Evaluate the joint log posterior for a saved naive baseline draw.
+"""
+function logposterior(
+    X::AbstractMatrix{<:Real},
+    y::AbstractVector{<:Integer},
+    sample::NaiveRegressionSample,
+    cfg::RegressionConfig,
+)
+    state = RegressionState(copy(sample.beta), copy(sample.gamma), sample.intercept, 0.0, sample.omega, sample.tau2)
+    return _logposterior_naive(Matrix{Float64}(X), _normalize_binary_vector(y), state, cfg)
+end
+
+function logposterior(
+    x::Vector{<:AbstractMatrix{<:Real}},
+    y::AbstractVector{<:Integer},
+    sample::NaiveRegressionSample,
+    cfg::RegressionConfig,
+)
+    return logposterior(naive_average_matrix(x), y, sample, cfg)
+end
+
+function logposterior(
+    data::ScalarOnMatrixData,
+    sample::NaiveRegressionSample,
+    cfg::RegressionConfig,
+)
+    return logposterior(data.patients, data.y, sample, cfg)
+end
+
+function logposterior(
+    patients::Vector{LabeledPatientMatrix},
+    y::AbstractVector{<:Integer},
+    sample::NaiveRegressionSample,
+    cfg::RegressionConfig,
+)
+    return logposterior(naive_average_matrix(patients), y, sample, cfg)
+end
+
+"""
+    sample_naive_regression([rng], x, y, cfg, n_iters; burnin=0, thin=1)
+    sample_naive_regression([rng], data, cfg, n_iters; burnin=0, thin=1)
+
+Run the naive non-cluster-aware spike-and-slab logistic baseline that averages each
+patient's repeated measurements before fitting the regression.
+"""
+function sample_naive_regression(
+    rng::AbstractRNG,
+    x::Vector{<:AbstractMatrix{<:Real}},
+    y::AbstractVector{<:Integer},
+    cfg::RegressionConfig,
+    n_iters::Integer;
+    burnin::Integer = 0,
+    thin::Integer = 1,
+)
+    n_iters > 0 || throw(ArgumentError("n_iters must be positive."))
+    0 <= burnin < n_iters || throw(ArgumentError("burnin must satisfy 0 <= burnin < n_iters."))
+    thin > 0 || throw(ArgumentError("thin must be positive."))
+
+    X = naive_average_matrix(x)
+    yvec = _normalize_binary_vector(y)
+    size(X, 1) == length(yvec) || throw(ArgumentError("The response vector must match the number of patients."))
+
+    p = size(X, 2)
+    state = _initialize_naive_state(rng, X, yvec)
+    samples = NaiveRegressionSample[]
+    logpost_trace = Float64[]
+    active_trace = Int[]
+    beta_accept = 0
+    intercept_accept = 0
+
+    for iter in 1:n_iters
+        _update_gamma_naive!(rng, X, yvec, state)
+        state.omega = rand(rng, Beta(cfg.a_omega + sum(state.gamma), cfg.b_omega + p - sum(state.gamma)))
+        state.tau2 = rand(rng, InverseGamma(cfg.a_tau + p / 2, cfg.b_tau + dot(state.beta, state.beta) / 2))
+
+        beta_target = β -> _logposterior_beta_naive(X, yvec, state, β)
+        beta_accept += mala_step_vector!(rng, state.beta, cfg.beta_step, beta_target) ? 1 : 0
+
+        intercept_target = b0 -> _logposterior_intercept_naive(X, yvec, state, cfg, b0)
+        state.intercept, accepted = mala_step_scalar(rng, state.intercept, cfg.intercept_step, intercept_target)
+        intercept_accept += accepted ? 1 : 0
+
+        push!(logpost_trace, _logposterior_naive(X, yvec, state, cfg))
+        push!(active_trace, sum(state.gamma))
+
+        if iter > burnin && ((iter - burnin) % thin == 0)
+            push!(samples, _naive_sample_from_state(X, yvec, state, cfg))
+        end
+    end
+
+    if isempty(samples)
+        push!(samples, _naive_sample_from_state(X, yvec, state, cfg))
+    end
+
+    final_sample = _naive_sample_from_state(X, yvec, state, cfg)
+    summary = _summarize_naive_samples(samples, beta_accept, intercept_accept, n_iters)
+    return NaiveRegressionResult(samples, summary, logpost_trace, active_trace, final_sample)
+end
+
+sample_naive_regression(
+    rng::AbstractRNG,
+    patients::Vector{LabeledPatientMatrix},
+    y::AbstractVector{<:Integer},
+    cfg::RegressionConfig,
+    n_iters::Integer;
+    kwargs...,
+) = sample_naive_regression(rng, [patient.x for patient in patients], y, cfg, n_iters; kwargs...)
+
+sample_naive_regression(
+    rng::AbstractRNG,
+    data::ScalarOnMatrixData,
+    cfg::RegressionConfig,
+    n_iters::Integer;
+    kwargs...,
+) = sample_naive_regression(rng, data.patients, data.y, cfg, n_iters; kwargs...)
+
+sample_naive_regression(
+    x::Vector{<:AbstractMatrix{<:Real}},
+    y::AbstractVector{<:Integer},
+    cfg::RegressionConfig,
+    n_iters::Integer;
+    kwargs...,
+) = sample_naive_regression(Random.default_rng(), x, y, cfg, n_iters; kwargs...)
+
+sample_naive_regression(
+    patients::Vector{LabeledPatientMatrix},
+    y::AbstractVector{<:Integer},
+    cfg::RegressionConfig,
+    n_iters::Integer;
+    kwargs...,
+) = sample_naive_regression(Random.default_rng(), patients, y, cfg, n_iters; kwargs...)
+
+sample_naive_regression(data::ScalarOnMatrixData, cfg::RegressionConfig, n_iters::Integer; kwargs...) =
+    sample_naive_regression(Random.default_rng(), data, cfg, n_iters; kwargs...)
 
 end

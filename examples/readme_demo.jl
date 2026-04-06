@@ -9,24 +9,39 @@ using SOMSOS
 
 rng = MersenneTwister(20260406)
 
-sim = simulate_glam_style_regression_data(
-    rng,
-    SimulationConfig(
-        n_subjects = 48,
-        n_features = 8,
-        min_repeats = 12,
-        max_repeats = 18,
-    );
-    active_indices = [1, 3, 5],
-    active_values = [2.6, -2.2, 1.8],
-    true_t = 0.85,
-    true_intercept = 0.4,
-)
+function make_demo_data(rng; n_patients = 32)
+    patients = LabeledPatientMatrix[]
+    y = Int[]
+    true_beta = [2.1, 0.0, -1.5]
+    true_t = 0.8
+    true_intercept = 0.2
 
-result = sample_regression(rng, sim.data, RegressionConfig(), 200; burnin = 100, thin = 20)
+    for _ in 1:n_patients
+        component1 = hcat(
+            -1.3 .+ 0.25 .* randn(rng, 5),
+            0.15 .* randn(rng, 5),
+            -1.0 .+ 0.25 .* randn(rng, 5),
+        )
+        component2 = hcat(
+            1.3 .+ 0.25 .* randn(rng, 6),
+            0.15 .* randn(rng, 6),
+            1.0 .+ 0.25 .* randn(rng, 6),
+        )
+        patient = LabeledPatientMatrix(vcat(component1, component2), vcat(fill(1, 5), fill(2, 6)))
+        signal = working_design([patient], true_t)[1, :]
+        eta = true_intercept + sum(signal .* true_beta)
+        push!(patients, patient)
+        push!(y, rand(rng) < 1 / (1 + exp(-eta)) ? 1 : 0)
+    end
 
-println("saved draws: ", length(result.samples))
-println("posterior mean t: ", round(result.summary.mean_t; digits = 3))
-println("posterior inclusion probabilities: ", round.(result.summary.pip; digits = 3))
-println("last log posterior: ", round(result.final_sample.logposterior; digits = 2))
-println("true active set: ", findall(==(1), sim.true_gamma))
+    return ScalarOnMatrixData(patients, y)
+end
+
+data = make_demo_data(rng)
+aware = sample_regression(rng, data, RegressionConfig(), 200; burnin = 100, thin = 20)
+naive = sample_naive_regression(rng, data, RegressionConfig(), 200; burnin = 100, thin = 20)
+
+println("cluster-aware mean t: ", round(aware.summary.mean_t; digits = 3))
+println("cluster-aware PIPs: ", round.(aware.summary.pip; digits = 3))
+println("naive PIPs: ", round.(naive.summary.pip; digits = 3))
+println("first five aware probabilities: ", round.(predict_probabilities(aware, data)[1:5]; digits = 3))
